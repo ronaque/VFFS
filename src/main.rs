@@ -3,7 +3,8 @@ mod utils;
 use crate::utils::{system_time_from_time, time_from_system_time, time_now};
 use clap::{Arg, ArgAction, Command};
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyWrite, Request,
+    TimeOrNow,
 };
 use fuser::{MountOption, ReplyEntry, FUSE_ROOT_ID};
 use libc::c_int;
@@ -279,6 +280,8 @@ impl Filesystem for VFFS {
         }
     }
 
+    /// Set the attributes of a file or directory.
+    /// The method updates received attributes of the specified inode in the VFFS
     fn setattr(
         &mut self,
         _req: &Request<'_>,
@@ -297,10 +300,10 @@ impl Filesystem for VFFS {
         flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        println!(
-            "setattr() called with ino: {ino}, mode: {:?}, uid: {:?}, gid: {:?}, size: {:?}, fh: {:?}, flags: {:?}",
-            mode, uid, gid, size, fh, flags
-        );
+        // println!(
+        //     "setattr() called with ino: {ino}, mode: {:?}, uid: {:?}, gid: {:?}, size: {:?}, fh: {:?}, flags: {:?}",
+        //     mode, uid, gid, size, fh, flags
+        // );
         match self.lookup_node_mut(ino) {
             Ok(inode) => {
                 if let Some(new_mode) = mode {
@@ -342,6 +345,50 @@ impl Filesystem for VFFS {
         };
         println!("Updated inode for setattr: {:?}", inode);
         reply.attr(&Duration::new(0, 0), &inode.into());
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        write_flags: u32,
+        flags: i32,
+        lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        // println!(
+        //     "write() called with ino: {ino}, fh: {fh}, offset: {offset}, data size: {}, write_flags: {write_flags}, flags: {flags}, lock_owner: {:?}",
+        //     data.len()
+        // );
+        match self.lookup_node_mut(ino) {
+            Ok(inode) => {
+                if inode.is_file() {
+                    match &mut inode.data {
+                        InodeData::File(file) => {
+                            file.write_date(data);
+                            inode.size = file.data.len() as u64;
+                            inode.update_changes();
+
+                            println!("Written data to inode for write: {:?}", inode);
+                            reply.written(data.len() as u32);
+                        }
+                        _ => {
+                            eprintln!("Error: trying to write to a non-file inode");
+                            reply.error(libc::EISDIR);
+                        }
+                    }
+                } else {
+                    eprintln!("Error: trying to write to a non-file inode");
+                    reply.error(libc::EISDIR);
+                }
+            }
+            Err(err) => {
+                reply.error(err);
+            }
+        }
     }
 }
 
@@ -576,6 +623,11 @@ impl File {
 
     pub fn new_with_data(name: String, data: String) -> File {
         File { name, data }
+    }
+
+    pub fn write_date(&mut self, data: &[u8]) {
+        let data_str = String::from_utf8_lossy(data).to_string();
+        self.data.push_str(&data_str);
     }
 
     pub fn clone(&self) -> File {
