@@ -1,8 +1,10 @@
 mod utils;
 
-use crate::utils::{system_time_from_time, time_now};
+use crate::utils::{system_time_from_time, time_from_system_time, time_now};
 use clap::{Arg, ArgAction, Command};
-use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, Request};
+use fuser::{
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, Request, TimeOrNow,
+};
 use fuser::{MountOption, ReplyEntry, FUSE_ROOT_ID};
 use libc::c_int;
 use log::LevelFilter;
@@ -104,6 +106,9 @@ impl Filesystem for VFFS {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        // println!("create() called with parent: {parent}, name: {:?}, mode: {mode:o}, umask: {umask:o}, flags: {flags}",
+        //     name.to_str().unwrap()
+        // );
         let name_str = name.to_str().unwrap().to_string();
 
         // Check if parent is a directory
@@ -125,7 +130,7 @@ impl Filesystem for VFFS {
 
         let new_inode = Inode {
             id: get_next_serial_number(),
-            size: (size_of::<Inode>() + size_of::<File>()) as u64,
+            size: 0,
             updated_at: time_now(),
             accessed_at: time_now(),
             metadata_change_at: time_now(),
@@ -151,6 +156,11 @@ impl Filesystem for VFFS {
             return;
         }
 
+        println!(
+            "Created inode {:?} for create with parent: {parent} and name: {:?}",
+            new_inode_id,
+            name.to_str()
+        );
         reply.created(&Duration::new(0, 0), &file_attr, 0, 0, 0);
     }
 
@@ -163,7 +173,7 @@ impl Filesystem for VFFS {
     /// and `name` is the name of the entry to look up.
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = name.to_str().unwrap();
-        println!("lookup parent: {parent}, name: {name_str}. Looking for inode...");
+        // println!("lookup parent: {parent}, name: {name_str}. Looking for inode...");
 
         match self.lookup_node(parent) {
             Ok(inode) => {
@@ -202,6 +212,10 @@ impl Filesystem for VFFS {
                     }
                 };
 
+                println!(
+                    "Found inode {:?} for lookup with parent: {parent} and name: {name_str}",
+                    file_inode
+                );
                 reply.entry(&Duration::new(0, 0), &file_inode.into(), 0)
             }
             Err(err) => reply.error(err),
@@ -216,7 +230,7 @@ impl Filesystem for VFFS {
         // println!("getattr() called with ino: {ino}, fh: {fh:?}");
         match self.lookup_node(ino) {
             Ok(inode) => {
-                // println!("Found inode for getattr: {:?}", inode);
+                println!("Found inode {:?} for getattr with ino: {ino} ", inode);
                 reply.attr(&Duration::new(0, 0), &inode.into())
             }
             Err(err) => reply.error(err),
@@ -236,10 +250,10 @@ impl Filesystem for VFFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        println!("readdir() called with ino: {ino}, fh: {fh}, offset: {offset}");
+        // println!("readdir() called with ino: {ino}, fh: {fh}, offset: {offset}");
         match self.lookup_node(ino) {
             Ok(inode) => {
-                println!("Found inode for readdir: {:?}", inode);
+                // println!("Found inode for readdir: {:?}", inode);
                 match &inode.data {
                     InodeData::Directory(directory) => {
                         let mut entry_offset: i64 = 0;
@@ -263,6 +277,71 @@ impl Filesystem for VFFS {
             }
             Err(err) => reply.error(err),
         }
+    }
+
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        println!(
+            "setattr() called with ino: {ino}, mode: {:?}, uid: {:?}, gid: {:?}, size: {:?}, fh: {:?}, flags: {:?}",
+            mode, uid, gid, size, fh, flags
+        );
+        match self.lookup_node_mut(ino) {
+            Ok(inode) => {
+                if let Some(new_mode) = mode {
+                    inode.mode = new_mode as u16;
+                }
+                if let Some(new_uid) = uid {
+                    inode.uid = new_uid;
+                }
+                if let Some(new_gid) = gid {
+                    inode.gid = new_gid;
+                }
+                if let Some(new_size) = size {
+                    inode.size = new_size;
+                }
+                if let Some(access_time) = _atime {
+                    match access_time {
+                        TimeOrNow::SpecificTime(system_time) => {
+                            inode.accessed_at = time_from_system_time(&system_time);
+                        }
+                        TimeOrNow::Now => {
+                            inode.accessed_at = time_now();
+                        }
+                    }
+                }
+                inode.update_changes();
+            }
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        }
+
+        let inode = match self.lookup_node(ino) {
+            Ok(inode) => inode,
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        };
+        println!("Updated inode for setattr: {:?}", inode);
+        reply.attr(&Duration::new(0, 0), &inode.into());
     }
 }
 
