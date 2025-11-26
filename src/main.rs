@@ -42,16 +42,16 @@ impl From<InodeData> for FileType {
     }
 }
 
-struct MyFS {
+struct VFFS {
     inodes: HashMap<u64, Inode>,
 }
 
-impl MyFS {
-    fn new(mount: &String) -> MyFS {
+impl VFFS {
+    fn new(mount: &String) -> VFFS {
         let root = Inode::new(DIR_MODE, mount.clone(), FUSE_ROOT_ID);
         let mut inodes = HashMap::new();
         inodes.insert(FUSE_ROOT_ID, root);
-        MyFS { inodes }
+        VFFS { inodes }
     }
 
     fn lookup_node(&self, id: u64) -> Result<&Inode, c_int> {
@@ -87,7 +87,13 @@ impl MyFS {
     }
 }
 
-impl Filesystem for MyFS {
+impl Filesystem for VFFS {
+    /// Create a new file in the specified parent directory.
+    /// The creation of the file consists of allocating a new inode, adding it to the VFFS
+    /// and updating the parent directory structure to include the new file.
+    ///
+    /// The `parent` parameter is the inode number of the parent directory,
+    /// `name` is the name of the new file to be created
     fn create(
         &mut self,
         _req: &Request<'_>,
@@ -100,6 +106,8 @@ impl Filesystem for MyFS {
     ) {
         let name_str = name.to_str().unwrap().to_string();
 
+        // Check if parent is a directory
+        // It must be in a local scope to avoid holding the borrow too long
         {
             let parent_inode = match self.lookup_node(parent) {
                 Ok(inode) => inode,
@@ -115,12 +123,26 @@ impl Filesystem for MyFS {
             }
         }
 
-        let new_inode = Inode::new(FILE_MODE, name_str.clone(), get_next_serial_number());
+        let new_inode = Inode {
+            id: get_next_serial_number(),
+            size: (size_of::<Inode>() + size_of::<File>()) as u64,
+            updated_at: time_now(),
+            accessed_at: time_now(),
+            metadata_change_at: time_now(),
+            data: InodeData::File(File::new(name_str.clone())),
+            mode: (mode & !umask) as u16,
+            hardlinks: 1,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            xattrs: BTreeMap::default(),
+        };
         let new_inode_id = new_inode.id;
         let file_attr: FileAttr = (&new_inode).into();
 
+        // Add the new inode to the filesystem
         self.append_inode(new_inode);
 
+        // Add the new file to the parent directory structure
         if let Ok(parent_inode) = self.lookup_node_mut(parent) {
             let inode_data = (new_inode_id, name_str, FileType::RegularFile);
             parent_inode.append_file_to_directory(inode_data);
@@ -132,6 +154,13 @@ impl Filesystem for MyFS {
         reply.created(&Duration::new(0, 0), &file_attr, 0, 0, 0);
     }
 
+    /// Look up a directory entry by name and get its attributes.
+    /// The method searches for any entry with the given name in the specified parent directory
+    /// structure. If found, it retrieves the corresponding inode from the VFFS and returns its
+    /// attributes.
+    ///
+    /// The `parent` parameter is the inode number of the parent directory,
+    /// and `name` is the name of the entry to look up.
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = name.to_str().unwrap();
         println!("lookup parent: {parent}, name: {name_str}. Looking for inode...");
@@ -179,6 +208,10 @@ impl Filesystem for MyFS {
         }
     }
 
+    /// Get the attributes of a file or directory by its inode number.
+    /// The method retrieves the attributes of the specified inode from the VFFS.
+    ///
+    /// The `ino` parameter is the inode number of the file or directory.
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
         // println!("getattr() called with ino: {ino}, fh: {fh:?}");
         match self.lookup_node(ino) {
@@ -190,6 +223,11 @@ impl Filesystem for MyFS {
         }
     }
 
+    /// Read the contents of a directory.
+    /// The method retrieves the list of entries in the specified directory inode
+    /// from the VFFS and adds them to the reply.
+    ///
+    /// The `ino` parameter is the inode number of the directory to read.
     fn readdir(
         &mut self,
         _req: &Request<'_>,
@@ -557,5 +595,5 @@ fn main() {
 
     let options = vec![MountOption::FSName("VFFS".to_string())];
 
-    fuser::mount2(MyFS::new(&mountpoint), mountpoint, &options).unwrap();
+    fuser::mount2(VFFS::new(&mountpoint), mountpoint, &options).unwrap();
 }
