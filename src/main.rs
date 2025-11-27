@@ -412,6 +412,88 @@ impl Filesystem for VFFS {
             }
         }
     }
+
+    fn mkdir(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mut mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let name_str = name.to_str().unwrap().to_string();
+
+        // println!(
+        //     "mkdir() called with {parent:?} {name:?} {mode:o}"
+        // );
+        {
+            if let Ok(parent_inode) = self.lookup_node(parent) {
+                if let InodeData::Directory(dir) = &parent_inode.data {
+                    if dir.find_file_by_name(&name_str).is_some() {
+                        reply.error(libc::EEXIST);
+                        return;
+                    }
+                } else {
+                    reply.error(libc::ENOTDIR);
+                    return;
+                }
+            } else {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        }
+
+        // Update parent metadata
+        match self.lookup_node_mut(parent) {
+            Ok(parent_inode) => {
+                parent_inode.update_changes();
+            }
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        };
+
+        let new_inode = Inode {
+            id: get_next_serial_number(),
+            size: (size_of::<Inode>() + size_of::<Directory>()) as u64,
+            updated_at: time_now(),
+            accessed_at: time_now(),
+            metadata_change_at: time_now(),
+            data: InodeData::Directory(Directory::new(name_str.clone())),
+            mode: (mode & !umask) as u16,
+            hardlinks: 2,
+            uid: req.uid(),
+            gid: req.gid(), 
+            xattrs: BTreeMap::default(),
+        };
+
+        let new_inode_id = new_inode.id;
+        let attr_reply = (&new_inode).into();
+
+        self.append_inode(new_inode);
+
+        // Link directory to parent
+        match self.lookup_node_mut(parent) {
+            Ok(parent_inode) => {
+                let entry = (new_inode_id, name_str.clone(), FileType::Directory);
+                parent_inode.append_file_to_directory(entry);
+            }
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        }
+
+        println!(
+            "Created inode {:?} for mkdir with parent: {parent} and name: {:?}",
+            new_inode_id,
+            name.to_str()
+        );
+
+        reply.entry(&Duration::new(0, 0), &attr_reply, 0);
+    }
 }
 
 #[derive(Debug)]
