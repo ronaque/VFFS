@@ -2,10 +2,7 @@ mod utils;
 
 use crate::utils::{system_time_from_time, time_from_system_time, time_now};
 use clap::{Arg, ArgAction, Command};
-use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyWrite, Request,
-    TimeOrNow,
-};
+use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyWrite, Request, TimeOrNow};
 use fuser::{MountOption, ReplyEntry, FUSE_ROOT_ID};
 use libc::c_int;
 use log::LevelFilter;
@@ -21,13 +18,38 @@ const FILE_MODE: u8 = 1;
 const BLOCK_SIZE: u32 = 512;
 
 static mut INODE_SERIAL_NUMER: u64 = 2;
-
 fn get_next_serial_number() -> u64 {
     unsafe {
         let serial_number = INODE_SERIAL_NUMER;
         INODE_SERIAL_NUMER += 1;
         serial_number
     }
+}
+
+static mut MAX_MEMORY: u64 = 0; // Max memory of the program in MB
+
+fn set_max_memory(mb: u64) {
+    unsafe {
+        MAX_MEMORY = mb * 1024 * 1024;
+    }
+}
+
+fn get_max_memory() -> u64 {
+    unsafe { MAX_MEMORY }
+}
+
+const MAX_FILE_NAME_LENGTH: usize = 255; // Max file name length in bytes
+
+static mut MAX_FILE_SIZE: u64 = 0; // Max file size in MB
+
+fn set_max_file_size(mb: u64) {
+    unsafe {
+        MAX_FILE_SIZE = mb * 1024 * 1024;
+    }
+}
+
+fn get_max_file_size() -> u64 {
+    unsafe { MAX_FILE_SIZE }
 }
 
 #[derive(Debug, Clone)]
@@ -695,7 +717,7 @@ fn main() {
             Arg::new("mount-point")
                 .long("mount-point")
                 .value_name("MOUNT_POINT")
-                .default_value("")
+                .default_value("/tmp/vffs")
                 .help("Act as a client, and mount FUSE at given path"),
         )
         .arg(
@@ -704,7 +726,35 @@ fn main() {
                 .action(ArgAction::Count)
                 .help("Sets the level of verbosity"),
         )
+        .arg(
+            Arg::new("mem")
+                .short('m')
+                .long("memory-limit")
+                .help("Sets the maximum memory usage in MB")
+                .required(true),
+        )
+        .arg(
+            Arg::new("file-size")
+                .short('s')
+                .long("max-file-size")
+                .help("Sets the maximum file size in MB")
+                .default_value("1"),
+        )
         .get_matches();
+
+    let mem_limit: u64 = matches
+        .get_one::<String>("mem")
+        .unwrap()
+        .parse()
+        .expect("Memory limit must be a number");
+    set_max_memory(mem_limit);
+
+    let file_size_limit: u64 = matches
+        .get_one::<String>("file-size")
+        .unwrap()
+        .parse()
+        .expect("File size limit must be a number");
+    set_max_file_size(file_size_limit);
 
     let verbosity = matches.get_count("v");
     let log_level = match verbosity {
