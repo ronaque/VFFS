@@ -6,17 +6,24 @@ use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyWrite, Request,
     TimeOrNow,
 };
-use fuser::{MountOption, ReplyEntry, FUSE_ROOT_ID};
+use fuser::{MountOption, ReplyEntry, ReplyOpen, ReplyData, FUSE_ROOT_ID};
 use libc::c_int;
 use log::LevelFilter;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::mem::size_of;
+use std::fs::File as StdFile;
 use std::time::{Duration, SystemTime};
+use log::debug;
+use std::os::unix::fs::FileExt;
+use std::cmp::min;
 
 const DIR_MODE: u8 = 0;
 const FILE_MODE: u8 = 1;
+const FMODE_EXEC: i32 = 0x20;
+const FILE_HANDLE_READ_BIT: u64 = 1 << 63; //echo
+const FILE_HANDLE_WRITE_BIT: u64 = 1 << 62; // echo
 
 const BLOCK_SIZE: u32 = 512;
 
@@ -32,7 +39,7 @@ fn get_next_serial_number() -> u64 {
 
 #[derive(Debug, Clone)]
 pub enum InodeData {
-    File(File),
+    File(VirtualFile),
     Directory(Directory),
 }
 
@@ -47,14 +54,18 @@ impl From<InodeData> for FileType {
 
 struct VFFS {
     inodes: HashMap<u64, Inode>,
+    data_dir: String,
 }
 
 impl VFFS {
-    fn new(mount: &String) -> VFFS {
+    fn new(mount: &String, data_dir: String) -> VFFS {
         let root = Inode::new(DIR_MODE, mount.clone(), FUSE_ROOT_ID);
         let mut inodes = HashMap::new();
         inodes.insert(FUSE_ROOT_ID, root);
-        VFFS { inodes }
+        VFFS { 
+            inodes, 
+            data_dir, 
+        }
     }
 
     fn lookup_node(&self, id: u64) -> Result<&Inode, c_int> {
@@ -87,6 +98,18 @@ impl VFFS {
 
     fn append_inode(&mut self, inode: Inode) {
         self.inodes.insert(inode.id, inode);
+    }
+
+    fn content_path(&self, inode: u64) -> std::path::PathBuf {
+        // map inode to real disc address path
+        std::path::Path::new(&self.data_dir)
+            .join("contents")
+            .join(inode.to_string())
+    }
+
+    fn check_file_handle_read(fh: u64) -> bool {
+        // verify FH
+        (fh & FILE_HANDLE_READ_BIT) != 0
     }
 }
 
@@ -135,7 +158,7 @@ impl Filesystem for VFFS {
             updated_at: time_now(),
             accessed_at: time_now(),
             metadata_change_at: time_now(),
-            data: InodeData::File(File::new(name_str.clone())),
+            data: InodeData::File(VirtualFile::new(name_str.clone())),
             mode: (mode & !umask) as u16,
             hardlinks: 1,
             uid: _req.uid(),
@@ -164,6 +187,27 @@ impl Filesystem for VFFS {
         );
         reply.created(&Duration::new(0, 0), &file_attr, 0, 0, 0);
     }
+
+    /* 
+        classes: abstrações do mundo real - Colaborador
+        atributos: nome, idade, pix, setor, empresa, grupo da empresa
+        métodos: funções dentro do escopo de uma classe
+
+        interface: contrato de código onde você define métodos obrigatórios para uma classe implementar
+
+        interface ColaboradorRepository {
+
+            trazerColaboradoresBancoDeDados
+        }
+
+        public class Colaborador extends ColaboradorRepository {
+
+        }
+    */
+
+
+
+
 
     /// Look up a directory entry by name and get its attributes.
     /// The method searches for any entry with the given name in the specified parent directory
@@ -280,6 +324,90 @@ impl Filesystem for VFFS {
         }
     }
 
+    fn open(
+        &mut self,
+        req: &Request,
+        inode: u64,
+        flags: i32,
+        reply: ReplyOpen
+    ) {
+        debug!("open() function called for {inode:?}");
+
+        let(access_mask, read, write) = match flags & libc::O_ACCMODE {
+            libc::O_RDONLY => {
+                if flags & libc::O_TRUNC != 0 {
+                    reply.error(libc::EACCES);
+                    return;
+                }
+                if flags & FMODE_EXEC != 0 {
+                    (libc::X_OK, true, false)
+                } else {
+                    (libc::R_OK, true, false)
+                }
+            }
+            libc::O_WRONLY => (libc::W_OK, false, true),
+            libc::O_RDWR => (libc::R_OK | libc::W_OK, true, true),
+            
+            _ => {
+                debug!("deu errado aqui \n");
+                reply.error(libc::EINVAL); // todo implement these error messages
+                return;
+            }
+        };
+        
+        // Sucesso: retornar file handle
+        let fh = inode; // usando inode como file handle
+        reply.opened(fh, 0);
+    }
+
+    fn read(
+        &mut self,
+        _req: &Request,
+        inode: u64,
+        _fh: u64, // file handle
+        offset: i64,
+        size: u32, // quantos bytes o kernel está pedindo
+        _flags: i32, // não utilizado
+        _lock_owner: Option<u64>, // info de lock do arquivo
+        reply: ReplyData
+    ) {
+        debug!("read() called on {inode:?} offset={offset:?} size={size:?}");
+        assert!(offset >= 0);
+        
+        // Buscar o inode na memória
+        match self.lookup_node(inode) {
+            Ok(node) => {
+                match &node.data {
+                    InodeData::File(virtual_file) => {
+                        // Ler dados da memória (VirtualFile)
+                        let data_bytes = virtual_file.data.as_bytes();
+                        let offset = offset as usize;
+                        
+                        // Calcular quanto vamos ler
+                        if offset >= data_bytes.len() {
+                            // Offset além do final do arquivo
+                            reply.data(&[]);
+                            return;
+                        }
+                        
+                        let available = data_bytes.len() - offset;
+                        let to_read = std::cmp::min(size as usize, available);
+                        
+                        // Retornar os dados
+                        reply.data(&data_bytes[offset..offset + to_read]);
+                    }
+                    InodeData::Directory(_) => {
+                        // Não pode ler um diretório
+                        reply.error(libc::EISDIR);
+                    }
+                }
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
+    }
+ 
     /// Set the attributes of a file or directory.
     /// The method updates received attributes of the specified inode in the VFFS
     fn setattr(
@@ -491,14 +619,14 @@ impl Inode {
                 xattrs: BTreeMap::default(),
             }
         } else {
-            let size = (size_of::<Inode>() + size_of::<File>()) as u64;
+            let size = (size_of::<Inode>() + size_of::<VirtualFile>()) as u64;
             Inode {
                 id: serial_number,
                 size,
                 updated_at: time_now(),
                 accessed_at: time_now(),
                 metadata_change_at: time_now(),
-                data: InodeData::File(File::new(name)),
+                data: InodeData::File(VirtualFile::new(name)),
                 mode: 0o777,
                 hardlinks: 0,
                 uid: 0,
@@ -608,21 +736,21 @@ impl Inode {
 }
 
 #[derive(Debug, Clone)]
-pub struct File {
+pub struct VirtualFile {
     name: String,
     data: String,
 }
 
-impl File {
-    pub fn new(name: String) -> File {
-        File {
+impl VirtualFile {
+    pub fn new(name: String) -> VirtualFile {
+        VirtualFile {
             name,
             data: String::new(),
         }
     }
 
-    pub fn new_with_data(name: String, data: String) -> File {
-        File { name, data }
+    pub fn new_with_data(name: String, data: String) -> VirtualFile {
+        VirtualFile { name, data }
     }
 
     pub fn write_date(&mut self, data: &[u8]) {
@@ -630,8 +758,8 @@ impl File {
         self.data.push_str(&data_str);
     }
 
-    pub fn clone(&self) -> File {
-        File {
+    pub fn clone(&self) -> VirtualFile {
+        VirtualFile {
             name: self.name.clone(),
             data: self.data.clone(),
         }
@@ -704,6 +832,13 @@ fn main() {
                 .action(ArgAction::Count)
                 .help("Sets the level of verbosity"),
         )
+        .arg(
+            Arg::new("data-dir")
+                .long("data-dir")
+                .value_name("DATA_DIR")
+                .default_value("./data")
+                .help("Directory to store filesystem data"),
+        )
         .get_matches();
 
     let verbosity = matches.get_count("v");
@@ -726,5 +861,6 @@ fn main() {
 
     let options = vec![MountOption::FSName("VFFS".to_string())];
 
-    fuser::mount2(VFFS::new(&mountpoint), mountpoint, &options).unwrap();
+    let data_dir = matches.get_one::<String>("data-dir").unwrap_or(&"./data".to_string()).to_string();
+    fuser::mount2(VFFS::new(&mountpoint, data_dir), mountpoint, &options).unwrap();
 }
