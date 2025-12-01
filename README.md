@@ -23,4 +23,4 @@ cargo run -- --mount-point <MOUNT_POINT> --memory-limit <MEMORY_LIMIT_IN_MB>
 
 Além destes parâmetros obrigatórios, existem outros parâmetros opcionais que podem ser utilizados:
 - `-v`: Define o nível de log com a contagem de repetições do parâmetro
-- `--max-file-size <SIZE_IN_MB>`: Define o tamanho máximo de um arquivo em megabytes. O padrão é 1 MB.
+- `--max-file-size <SIZE_IN_MB>`: Define o tamanho máximo dos arquivos em megabytes. O padrão é 1 MB.

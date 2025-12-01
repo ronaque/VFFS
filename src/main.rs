@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 mod utils;
 
 use crate::utils::{system_time_from_time, time_from_system_time, time_now};
@@ -134,31 +136,47 @@ impl VFFS {
     /// The method validates the size of the data to be written against
     /// the maximum file size and available memory,
     /// and writes the data to the file's data buffer.
+    /// If successful, it updates the total filesystem size.
     fn write_file_data(&mut self, inode_id: u64, data: &[u8]) -> Result<(), c_int> {
-        let new_size = data.len() as u64;
-        if new_size > get_max_file_size() {
-            return Err(libc::EFBIG);
+        let data_len = data.len() as u64;
+
+        let size_diff: i64;
+
+        {
+            let inode = match self.lookup_node_mut(inode_id) {
+                Ok(inode) => inode,
+                Err(err) => return Err(err),
+            };
+
+            match &mut inode.data {
+                InodeData::File(virtual_file) => {
+                    let old_size = inode.size;
+                    virtual_file.write_date(data);
+
+                    let final_size = old_size + data_len;
+
+                    if final_size > get_max_file_size() {
+                        return Err(libc::EFBIG);
+                    }
+
+                    size_diff = final_size as i64 - old_size as i64;
+
+                    inode.size = final_size;
+                    inode.update_changes();
+                }
+                _ => return Err(libc::EISDIR),
+            }
         }
 
-        if (self.size + new_size) > get_max_memory() {
+        let new_total_size = (self.size as i64 + size_diff) as u64;
+
+        if new_total_size > get_max_memory() {
             return Err(libc::ENOMEM);
         }
 
-        let inode = match self.lookup_node_mut(inode_id) {
-            Ok(inode) => inode,
-            Err(err) => {
-                return Err(err);
-            }
-        };
+        self.size = new_total_size;
 
-        match &mut inode.data {
-            InodeData::File(virtual_file) => {
-                virtual_file.data = String::from_utf8_lossy(data).to_string();
-                inode.size = new_size;
-                Ok(())
-            }
-            _ => Err(libc::EISDIR),
-        }
+        Ok(())
     }
 
     fn validate_and_return_node_name(name: &OsStr) -> Result<String, c_int> {
@@ -297,7 +315,8 @@ impl Filesystem for VFFS {
         //     new_inode_id,
         //     name.to_str()
         // );
-        println!("Created file. Filesystem: {:?}", self.tree());
+        println!("Created file. Filesystem:");
+        self.tree();
         reply.created(&Duration::new(0, 0), &file_attr, 0, 0, 0);
     }
 
@@ -309,7 +328,7 @@ impl Filesystem for VFFS {
         // println!("getattr() called with ino: {ino}, fh: {fh:?}");
         match self.lookup_node(ino) {
             Ok(inode) => {
-                println!("Found inode {:?} for getattr with ino: {ino} ", inode);
+                // println!("Found inode {:?} for getattr with ino: {ino} ", inode);
                 reply.attr(&Duration::new(0, 0), &inode.into())
             }
             Err(err) => reply.error(err),
@@ -364,10 +383,10 @@ impl Filesystem for VFFS {
                     }
                 };
 
-                println!(
-                    "Found inode {:?} for lookup with parent: {parent} and name: {name_str}",
-                    file_inode
-                );
+                // println!(
+                //     "Found inode {:?} for lookup with parent: {parent} and name: {name_str}",
+                //     file_inode
+                // );
                 reply.entry(&Duration::new(0, 0), &file_inode.into(), 0)
             }
             Err(err) => reply.error(err),
@@ -463,13 +482,14 @@ impl Filesystem for VFFS {
         //     new_inode_id,
         //     name.to_str()
         // );
-        println!("Created directory. Filesystem: {:?}", self.tree());
+        println!("Created directory. Filesystem:");
+        self.tree();
 
         reply.entry(&Duration::new(0, 0), &attr_reply, 0);
     }
 
     fn open(&mut self, req: &Request, inode: u64, flags: i32, reply: ReplyOpen) {
-        debug!("open() function called for {inode:?}");
+        // debug!("open() function called for {inode:?}");
 
         let (_, _, _) = match flags & libc::O_ACCMODE {
             libc::O_RDONLY => {
@@ -487,8 +507,7 @@ impl Filesystem for VFFS {
             libc::O_RDWR => (libc::R_OK | libc::W_OK, true, true),
 
             _ => {
-                debug!("deu errado aqui \n");
-                reply.error(libc::EINVAL); // todo implement these error messages
+                reply.error(libc::EINVAL);
                 return;
             }
         };
@@ -508,7 +527,7 @@ impl Filesystem for VFFS {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        debug!("read() called on {inode:?} offset={offset:?} size={size:?}");
+        // debug!("read() called on {inode:?} offset={offset:?} size={size:?}");
         assert!(offset >= 0);
 
         match self.lookup_node(inode) {
@@ -570,7 +589,6 @@ impl Filesystem for VFFS {
                         reply.ok();
                     }
                     _ => {
-                        eprintln!("Error: trying to read a non-directory inode");
                         reply.error(libc::ENOTDIR);
                     }
                 }
@@ -592,8 +610,7 @@ impl Filesystem for VFFS {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        let name_str = name.to_str().unwrap();
-        // let new_name_str = new_name.to_str().unwrap();
+        let name_str = name.to_str().unwrap().to_string();
         let new_name_string = match VFFS::validate_and_return_node_name(new_name) {
             Ok(name) => name,
             Err(err) => {
@@ -601,15 +618,9 @@ impl Filesystem for VFFS {
                 return;
             }
         };
-        let new_name_str = new_name_string.as_str();
 
-        debug!(
-            "rename() called: {} (parent {}) -> {} (parent {})",
-            name_str, parent, new_name_str, new_parent
-        );
-
-        // 1. Find the inode to be renamed in the parent directory
-        let inode_id = {
+        // Find source node in the parent directory
+        let source_inode_id = {
             let parent_inode = match self.lookup_node(parent) {
                 Ok(inode) => inode,
                 Err(err) => {
@@ -623,25 +634,23 @@ impl Filesystem for VFFS {
                 return;
             }
 
-            let directory = match &parent_inode.data {
-                InodeData::Directory(dir) => dir,
+            match &parent_inode.data {
+                InodeData::Directory(dir) => match dir.find_node_by_name(&name_str) {
+                    Some((id, _, _)) => id,
+                    None => {
+                        reply.error(libc::ENOENT);
+                        return;
+                    }
+                },
                 _ => {
                     reply.error(libc::ENOTDIR);
-                    return;
-                }
-            };
-
-            match directory.find_node_by_name(name_str) {
-                Some((id, _, _)) => id,
-                None => {
-                    reply.error(libc::ENOENT);
                     return;
                 }
             }
         };
 
-        // 2. Verify that new_parent is a directory
-        {
+        // Check if target node exists in the new parent directory
+        let target_inode_id_opt = {
             let new_parent_inode = match self.lookup_node(new_parent) {
                 Ok(inode) => inode,
                 Err(err) => {
@@ -654,124 +663,92 @@ impl Filesystem for VFFS {
                 reply.error(libc::ENOTDIR);
                 return;
             }
-        }
 
-        // 3. Check if target already exists in new location
-        let target_exists = {
-            let new_parent_inode = self.lookup_node(new_parent).unwrap();
-            let directory = match &new_parent_inode.data {
-                InodeData::Directory(dir) => dir,
+            match &new_parent_inode.data {
+                InodeData::Directory(dir) => {
+                    dir.find_node_by_name(&new_name_string).map(|(id, _, _)| id)
+                }
                 _ => {
                     reply.error(libc::ENOTDIR);
                     return;
                 }
-            };
-            directory.find_node_by_name(new_name_str).is_some()
+            }
         };
 
-        // 4. If target exists and is a directory, check if it's empty
-        if target_exists {
-            let new_parent_inode = self.lookup_node(new_parent).unwrap();
-            let directory = match &new_parent_inode.data {
-                InodeData::Directory(dir) => dir,
-                _ => {
-                    reply.error(libc::ENOTDIR);
+        // Handle target node if it exists
+        if let Some(target_id) = target_inode_id_opt {
+            if target_id == source_inode_id {
+                reply.ok();
+                return;
+            }
+
+            let target_inode = self.lookup_node(target_id).unwrap();
+
+            if let InodeData::Directory(dir) = &target_inode.data {
+                if !dir.nodes.is_empty() {
+                    reply.error(libc::ENOTEMPTY);
                     return;
-                }
-            };
-
-            if let Some((target_id, _, target_type)) = directory.find_node_by_name(new_name_str) {
-                if target_type == FileType::Directory {
-                    // Check if directory is empty
-                    let target_inode = match self.lookup_node(target_id) {
-                        Ok(inode) => inode,
-                        Err(err) => {
-                            reply.error(err);
-                            return;
-                        }
-                    };
-
-                    if let InodeData::Directory(target_dir) = &target_inode.data {
-                        if !target_dir.nodes.is_empty() {
-                            reply.error(libc::ENOTEMPTY);
-                            return;
-                        }
-                    }
-
-                    // Remove the empty target directory
-                    if let Ok(new_parent_inode) = self.lookup_node_mut(new_parent) {
-                        if let InodeData::Directory(dir) = &mut new_parent_inode.data {
-                            dir.nodes.retain(|(_, n, _)| n != new_name_str);
-                        }
-                    }
-                    // Remove target inode from filesystem
-                    self.inodes.remove(&target_id);
-                } else {
-                    // Target is a file, just remove it
-                    if let Ok(new_parent_inode) = self.lookup_node_mut(new_parent) {
-                        if let InodeData::Directory(dir) = &mut new_parent_inode.data {
-                            dir.nodes.retain(|(_, n, _)| n != new_name_str);
-                        }
-                    }
                 }
             }
         }
 
-        // 5. Get the file type from the inode being moved
-        let file_type = {
-            let inode = match self.lookup_node(inode_id) {
-                Ok(inode) => inode,
-                Err(err) => {
-                    reply.error(err);
-                    return;
+        // Remove source from old parent and add to new parent
+        if let Some(target_id) = target_inode_id_opt {
+            self.remove_inode(target_id);
+
+            if let Ok(new_p_inode) = self.lookup_node_mut(new_parent) {
+                if let InodeData::Directory(dir) = &mut new_p_inode.data {
+                    dir.nodes.retain(|(id, _, _)| *id != target_id);
                 }
-            };
-
-            match &inode.data {
-                InodeData::File(_) => FileType::RegularFile,
-                InodeData::Directory(_) => FileType::Directory,
             }
-        };
+        }
 
-        // 6. Remove entry from old parent directory
-        if let Ok(parent_inode) = self.lookup_node_mut(parent) {
-            if let InodeData::Directory(dir) = &mut parent_inode.data {
-                dir.nodes.retain(|(_, n, _)| n != name_str);
-            }
+        let file_type_cache;
+        // Update parent directory
+        {
+            let parent_inode = self
+                .lookup_node_mut(parent)
+                .expect("Parent checked in Phase 1");
             parent_inode.update_changes();
-        } else {
-            reply.error(libc::ENOENT);
-            return;
+
+            if let InodeData::Directory(dir) = &mut parent_inode.data {
+                let (_, _, f_type) = dir.find_node_by_name(&name_str).unwrap();
+                file_type_cache = f_type;
+
+                dir.nodes.retain(|(id, _, _)| *id != source_inode_id);
+            } else {
+                reply.error(libc::EIO);
+                return;
+            }
         }
 
-        // 7. Add entry to new parent directory
-        if let Ok(new_parent_inode) = self.lookup_node_mut(new_parent) {
-            if let InodeData::Directory(dir) = &mut new_parent_inode.data {
-                dir.add_node((inode_id, new_name_str.to_string(), file_type));
-            }
+        // Add to new parent directory
+        {
+            let new_parent_inode = self
+                .lookup_node_mut(new_parent)
+                .expect("New Parent checked in Phase 1");
             new_parent_inode.update_changes();
-        } else {
-            reply.error(libc::ENOENT);
-            return;
-        }
 
-        // 8. Update the inode's name if it's being renamed
-        if let Ok(inode) = self.lookup_node_mut(inode_id) {
-            match &mut inode.data {
-                InodeData::File(file) => {
-                    file.name = new_name_str.to_string();
-                }
-                InodeData::Directory(directory) => {
-                    directory.name = new_name_str.to_string();
-                }
+            if let InodeData::Directory(dir) = &mut new_parent_inode.data {
+                dir.add_node((source_inode_id, new_name_string.clone(), file_type_cache));
             }
-            inode.update_changes();
         }
 
-        println!(
-            "Renamed inode {} from '{}' to '{}' (parent {} -> {})",
-            inode_id, name_str, new_name_str, parent, new_parent
-        );
+        // Update source inode name
+        {
+            let inode = self
+                .lookup_node_mut(source_inode_id)
+                .expect("Source checked in Phase 1");
+            inode.metadata_change_at = time_now();
+
+            match &mut inode.data {
+                InodeData::File(f) => f.name = new_name_string,
+                InodeData::Directory(d) => d.name = new_name_string,
+            }
+        }
+
+        println!("Renamed file/dir. Filesystem:");
+        self.tree();
 
         reply.ok();
     }
@@ -852,7 +829,8 @@ impl Filesystem for VFFS {
         // Remove the inode from the filesystem
         self.remove_inode(inode_id);
 
-        println!("Removed directory. Filesystem: {:?}", self.tree());
+        println!("Removed directory. Filesystem:");
+        self.tree();
         reply.ok();
     }
 
@@ -922,7 +900,7 @@ impl Filesystem for VFFS {
                 return;
             }
         };
-        println!("Updated inode for setattr: {:?}", inode);
+        // println!("Updated inode for setattr: {:?}", inode);
         reply.attr(&Duration::new(0, 0), &inode.into());
     }
 
@@ -983,7 +961,8 @@ impl Filesystem for VFFS {
         // Remove the inode from the filesystem
         self.remove_inode(inode_id);
 
-        println!("Removed file. Filesystem: {:?}", self.tree());
+        println!("Removed file. Filesystem:");
+        self.tree();
         reply.ok();
     }
 
