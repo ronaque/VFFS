@@ -2,10 +2,7 @@ mod utils;
 
 use crate::utils::{system_time_from_time, time_from_system_time, time_now};
 use clap::{Arg, ArgAction, Command};
-use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyWrite,
-    Request, TimeOrNow,
-};
+use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyOpen, ReplyWrite, Request, TimeOrNow};
 use fuser::{MountOption, ReplyEntry, FUSE_ROOT_ID};
 use libc::c_int;
 use log::{debug, LevelFilter};
@@ -19,6 +16,8 @@ const DIR_MODE: u8 = 0;
 const FILE_MODE: u8 = 1;
 
 const BLOCK_SIZE: u32 = 512;
+
+const FMODE_EXEC: i32 = 0x20;
 
 static mut INODE_SERIAL_NUMER: u64 = 2;
 fn get_next_serial_number() -> u64 {
@@ -260,6 +259,90 @@ impl Filesystem for VFFS {
                 reply.attr(&Duration::new(0, 0), &inode.into())
             }
             Err(err) => reply.error(err),
+        }
+    }
+
+    fn open(
+        &mut self,
+        req: &Request,
+        inode: u64,
+        flags: i32,
+        reply: ReplyOpen
+    ) {
+        debug!("open() function called for {inode:?}");
+
+        let(access_mask, read, write) = match flags & libc::O_ACCMODE {
+            libc::O_RDONLY => {
+                if flags & libc::O_TRUNC != 0 {
+                    reply.error(libc::EACCES);
+                    return;
+                }
+                if flags & FMODE_EXEC != 0 {
+                    (libc::X_OK, true, false)
+                } else {
+                    (libc::R_OK, true, false)
+                }
+            }
+            libc::O_WRONLY => (libc::W_OK, false, true),
+            libc::O_RDWR => (libc::R_OK | libc::W_OK, true, true),
+
+            _ => {
+                debug!("deu errado aqui \n");
+                reply.error(libc::EINVAL); // todo implement these error messages
+                return;
+            }
+        };
+
+        // Sucesso: retornar file handle
+        let fh = inode; // usando inode como file handle
+        reply.opened(fh, 0);
+    }
+
+    fn read(
+        &mut self,
+        _req: &Request,
+        inode: u64,
+        _fh: u64, // file handle
+        offset: i64,
+        size: u32, // quantos bytes o kernel está pedindo
+        _flags: i32, // não utilizado
+        _lock_owner: Option<u64>, // info de lock do arquivo
+        reply: ReplyData
+    ) {
+        debug!("read() called on {inode:?} offset={offset:?} size={size:?}");
+        assert!(offset >= 0);
+
+        // Buscar o inode na memória
+        match self.lookup_node(inode) {
+            Ok(node) => {
+                match &node.data {
+                    InodeData::File(virtual_file) => {
+                        // Ler dados da memória (VirtualFile)
+                        let data_bytes = virtual_file.data.as_bytes();
+                        let offset = offset as usize;
+
+                        // Calcular quanto vamos ler
+                        if offset >= data_bytes.len() {
+                            // Offset além do final do arquivo
+                            reply.data(&[]);
+                            return;
+                        }
+
+                        let available = data_bytes.len() - offset;
+                        let to_read = std::cmp::min(size as usize, available);
+
+                        // Retornar os dados
+                        reply.data(&data_bytes[offset..offset + to_read]);
+                    }
+                    InodeData::Directory(_) => {
+                        // Não pode ler um diretório
+                        reply.error(libc::EISDIR);
+                    }
+                }
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
         }
     }
 
